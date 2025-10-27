@@ -1,0 +1,48 @@
+# 01-storage-target.yml
+- name: Configure iSCSI Target on ansible-server
+  hosts: iscsi_target
+  become: yes
+  vars:
+    backstore_dir: /var/lib/iscsi-disks
+    backstore_file: "{{ backstore_dir }}/cluster-lun0.img"
+  tasks:
+    - name: Install iSCSI target packages
+      package:
+        name:
+          - targetcli
+        state: present
+
+    - name: Create backstore directory
+      file:
+        path: "{{ backstore_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Create file-backed LUN if not exists
+      command: fallocate -l {{ iscsi_lun_size_gb }}G {{ backstore_file }}
+      args:
+        creates: "{{ backstore_file }}"
+
+    - name: Configure targetcli LUN/Target/ACL/Portal
+      shell: |
+        targetcli <<EOF
+        /backstores/fileio create cluster_lun {{ backstore_file }}
+        /iscsi create {{ iscsi_target_iqn }}
+        /iscsi/{{ iscsi_target_iqn }}/tpg1/luns create /backstores/fileio/cluster_lun
+        /iscsi/{{ iscsi_target_iqn }}/tpg1/portals create {{ iscsi_portal_ip }} 3260
+        /iscsi/{{ iscsi_target_iqn }}/tpg1/acls create iqn.2025-09.lab:target1
+        /iscsi/{{ iscsi_target_iqn }}/tpg1/acls create iqn.2025-09.lab:target2
+        /iscsi/{{ iscsi_target_iqn }}/tpg1/acls create iqn.2025-09.lab:target3
+        saveconfig
+        exit
+        EOF
+      args:
+        executable: /bin/bash
+      register: iscsi_setup
+      changed_when: "'Created' in iscsi_setup.stdout or 'created' in iscsi_setup.stdout"
+
+    - name: Ensure iSCSI target service is enabled and started
+      systemd:
+        name: target
+        enabled: true
+        state: started

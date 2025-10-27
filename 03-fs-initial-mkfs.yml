@@ -1,0 +1,50 @@
+# 03-fs-initial-mkfs.yml
+- name: Connect initiators to iSCSI and prepare filesystem
+  hosts: cluster
+  become: yes
+  tasks:
+    - name: Ensure iscsi utils installed
+      package:
+        name: iscsi-initiator-utils
+        state: present
+
+    - name: Ensure iscsid running
+      service:
+        name: iscsid
+        state: started
+        enabled: true
+
+    - name: Discover target
+      command: >
+        iscsiadm -m discovery -t sendtargets -p {{ iscsi_portal_ip }}
+      register: discovery
+      changed_when: false
+
+    - name: Login to target
+      command: >
+        iscsiadm -m node -T {{ iscsi_target_iqn }} -p {{ iscsi_portal_ip }} --login
+      register: login
+      failed_when: login.rc not in [0, 15]   # 15 = already logged in
+
+    - name: Wait for the device to appear
+      wait_for:
+        path: "/dev/disk/by-path/ip-{{ iscsi_portal_ip }}:3260-iscsi-{{ iscsi_target_iqn }}-lun-0"
+        timeout: 60
+
+    - name: Create filesystem on LUN (run only once!)
+      filesystem:
+        fstype: ext4
+        dev: "/dev/disk/by-path/ip-{{ iscsi_portal_ip }}:3260-iscsi-{{ iscsi_target_iqn }}-lun-0"
+      run_once: true
+
+    - name: Create service directories on shared mount
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - "{{ shared_mount }}"
+        - "{{ apache_docroot }}"
+        - "{{ nfs_export }}"
+        - "{{ shared_mount }}/nfs"
+      run_once: true

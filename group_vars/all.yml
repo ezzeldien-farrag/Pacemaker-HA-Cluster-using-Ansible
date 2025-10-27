@@ -1,0 +1,22 @@
+# group_vars/all.yml
+
+vip_address: "192.168.33.1"
+vip_cidr: "24"
+cluster_iface: "enp0s8"          # set to your private/Vagrant NIC on target1-3
+
+# iSCSI settings
+iscsi_portal_ip: "192.168.33.20" # IP of ansible-server on the same network
+iscsi_target_iqn: "iqn.2025-09.lab:storage.target0"
+iscsi_lun_size_gb: 5
+backstore_file: "/var/lib/iscsi-disks/cluster-lun0.img"
+
+# Mount points / service paths
+shared_mount: "/srv/shared"
+apache_docroot: "/srv/shared/www"
+nfs_export: "/srv/shared/export"
+
+# Cluster auth user
+hacluster_password: "clusterpass"
+# Lab simplifications
+disable_firewalld: true
+selinux_mode: "permissive"

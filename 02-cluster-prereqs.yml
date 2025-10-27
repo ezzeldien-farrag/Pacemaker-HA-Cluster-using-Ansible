@@ -1,0 +1,84 @@
+# 02-cluster-prereqs.yml
+- name: Prepare cluster nodes (packages, SELinux, initiators)
+  hosts: cluster
+  become: yes
+  vars:
+    initiator_iqn: "iqn.2025-09.lab:{{ inventory_hostname }}"
+  tasks:
+    - name: Set SELinux to permissive (lab)
+      selinux:
+        policy: targeted
+        state: "{{ selinux_mode }}"
+    - name: Disable firewalld (lab)
+      service:
+        name: firewalld
+        state: stopped
+        enabled: no
+      when: disable_firewalld
+
+    - name: Enable High Availability repo (CentOS Stream 9)
+      command: dnf config-manager --set-enabled highavailability
+      register: ha_repo
+      changed_when: '"enabled" in ha_repo.stdout or ha_repo.rc == 0'
+
+    - name: Refresh DNF metadata
+      command: dnf makecache
+      when: ha_repo.changed
+
+    - name: Install cluster and service packages
+      package:
+        name:
+          - pacemaker
+          - pcs
+          - corosync
+          - resource-agents
+          - fence-agents-all
+          - httpd
+          - nfs-utils
+          - iscsi-initiator-utils
+        state: present
+
+    - name: Ensure pcsd is enabled and running
+      service:
+        name: pcsd
+        state: started
+        enabled: yes
+
+    - name: Set hacluster password
+      user:
+        name: hacluster
+        password: "{{ hacluster_password | password_hash('sha512') }}"
+    
+    - name: Generate iSCSI initiator name
+      command: iscsi-iname
+      register: initiator_name
+      changed_when: false   # running iscsi-iname doesn’t actually change the system
+
+    - name: Configure iSCSI initiator name
+      copy:
+        dest: /etc/iscsi/initiatorname.iscsi
+        content: "InitiatorName={{ initiator_name.stdout }}\n"
+        owner: root
+        group: root
+        mode: '0644'
+
+
+    - name: Configure iSCSI initiator IQN
+      lineinfile:
+        path: /etc/iscsi/initiatorname.iscsi
+        regexp: '^InitiatorName='
+        line: "InitiatorName={{ initiator_iqn }}"
+
+    - name: Restart iscsid to pick up new IQN
+      service:
+        name: iscsid
+        state: restarted
+
+    - name: Discover iSCSI target
+      command: iscsiadm -m discovery -t sendtargets -p {{ iscsi_portal_ip }}
+
+    - name: Log in to iSCSI target and set autostart
+      shell: |
+        iscsiadm -m node -T {{ iscsi_target_iqn }} -p {{ iscsi_portal_ip }} --login || true
+        iscsiadm -m node -T {{ iscsi_target_iqn }} -p {{ iscsi_portal_ip }} --op update -n node.startup -v automatic
+

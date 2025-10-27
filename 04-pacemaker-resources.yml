@@ -1,0 +1,121 @@
+# 04-pacemaker-resources.yml
+- name: Configure Pacemaker cluster and resources
+  hosts: target1
+  become: yes
+  tasks:
+    - name: Authenticate pcs to cluster nodes
+      command: pcs host auth target1 target2 target3 -u hacluster -p {{ hacluster_password }}
+      ignore_errors: yes
+
+    - name: Create the cluster (idempotent-ish)
+      shell: |
+        pcs cluster status >/dev/null 2>&1 && exit 0
+        pcs cluster setup ZOZ target1 target2 target3
+      args:
+        executable: /bin/bash
+
+    - name: Start and enable the cluster on all nodes
+      command: pcs cluster start --all
+
+    - name: Enable the cluster on boot
+      command: pcs cluster enable --all
+
+    # Lab properties (do NOT use in production)
+    - name: Disable STONITH (lab)
+      command: pcs property set stonith-enabled=false
+    - name: Keep default quorum behavior (3 nodes)
+      command: pcs property set no-quorum-policy=stop
+
+    # Resources
+    - name: Configure floating IP resource (idempotent)
+      shell: |
+        pcs resource show vip >/dev/null 2>&1 || \
+        pcs resource create vip ocf:heartbeat:IPaddr2 \
+          ip=192.168.33.1 cidr_netmask=24 nic=enp0s8 \
+          op monitor interval=20s
+      args:
+        executable: /bin/bash
+
+    - name: Ensure iSCSI LUN is logged in (already done)
+      shell: |
+        iscsiadm -m session | grep -q "{{ iscsi_target_iqn }}" || \
+        iscsiadm -m node -T "{{ iscsi_target_iqn }}" -p "{{ iscsi_portal_ip }}" --login
+      args:
+        executable: /bin/bash
+
+    - name: Create Filesystem mount resource
+      shell: |
+        pcs resource show fs_data >/dev/null 2>&1 || \
+        pcs resource create fs_data ocf:heartbeat:Filesystem \
+          device="/dev/disk/by-path/ip-{{ iscsi_portal_ip }}:3260-iscsi-{{ iscsi_target_iqn }}-lun-0" \
+          directory="{{ shared_mount }}" fstype=ext4 \
+          op monitor interval=20s timeout=40s
+      args:
+        executable: /bin/bash
+
+
+    - name: Apache will serve from shared docroot
+      lineinfile:
+        path: /etc/httpd/conf/httpd.conf
+        regexp: '^DocumentRoot '
+        line: "DocumentRoot \"{{ apache_docroot }}\""
+      delegate_to: "{{ item }}"
+      become: yes
+      loop: "{{ groups['cluster'] }}"
+
+    - name: Ensure Apache resource exists
+      shell: |
+        pcs resource show apache >/dev/null 2>&1 || \
+        pcs resource create apache systemd:httpd op monitor interval=30s
+      args:
+        executable: /bin/bash
+
+
+    - name: Create NFS server resource
+      shell: |
+        pcs resource show nfsserver >/dev/null 2>&1 || \
+        pcs resource create nfsserver ocf:heartbeat:nfsserver nfs_shared_infodir="{{ shared_mount }}/nfs" op monitor interval=30s
+      args:
+        executable: /bin/bash
+
+    - name: Export the NFS path
+      shell: |
+        pcs resource show export >/dev/null 2>&1 || \
+        pcs resource create export ocf:heartbeat:exportfs \
+          clientspec="*" \
+          options="rw,sync,no_root_squash,no_subtree_check" \
+          directory="{{ nfs_export }}" fsid=1 \
+          op monitor interval=30s
+      args:
+        executable: /bin/bash
+
+    # Ordering: fs_data -> (nfsserver & export & apache)
+    # Note: iSCSI is not a cluster resource - connections established in earlier playbooks
+    - name: Ordering constraints
+      shell: |
+        # Check and create constraints only if they don't exist
+        pcs constraint show | grep -q "fs_data then nfsserver" || pcs constraint order start fs_data then nfsserver
+        pcs constraint show | grep -q "nfsserver then export" || pcs constraint order start nfsserver then export
+        pcs constraint show | grep -q "fs_data then apache" || pcs constraint order start fs_data then apache
+      args: {executable: /bin/bash}
+      ignore_errors: yes
+
+    # Colocation: keep everything together (and with the VIP)
+    - name: Colocation constraints
+      shell: |
+        # Check and create constraints only if they don't exist
+        pcs constraint show | grep -q "fs_data.*with vip" || pcs constraint colocation add fs_data with vip INFINITY
+        pcs constraint show | grep -q "nfsserver.*with fs_data" || pcs constraint colocation add nfsserver with fs_data INFINITY
+        pcs constraint show | grep -q "export.*with nfsserver" || pcs constraint colocation add export with nfsserver INFINITY
+        pcs constraint show | grep -q "apache.*with fs_data" || pcs constraint colocation add apache with fs_data INFINITY
+        pcs constraint show | grep -q "apache.*with vip" || pcs constraint colocation add apache with vip INFINITY
+        pcs constraint show | grep -q "export.*with vip" || pcs constraint colocation add export with vip INFINITY
+      args: {executable: /bin/bash}
+      ignore_errors: yes
+
+  handlers:
+    - name: restart httpd
+      service:
+        name: httpd
+        state: restarted
+
